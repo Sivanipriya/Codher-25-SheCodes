@@ -8,7 +8,11 @@ from pymongo import MongoClient
 from collections import Counter
 from confluent_kafka import Producer
 import json
+from datetime import datetime
 
+now = datetime.now()
+month = now.strftime("%B")  # e.g., "April"
+year = now.year     
 app = Flask(__name__)
 CORS(app)
 
@@ -28,9 +32,9 @@ KAFKA_TOPIC = 'carbon-footprint-events'
 
 def kafka_delivery_callback(err, msg):
     if err:
-        print(f"Kafka Delivery Failed: {err}")
+        print(f"❌ Kafka Delivery Failed: {err}")
     else:
-        print(f"Kafka Message delivered to {msg.topic()} [{msg.partition()}]")
+        print(f"✅ Kafka Message delivered to {msg.topic()} [{msg.partition()}]")
 
 # Utility Functions
 def convert_numpy_types(data):
@@ -158,7 +162,9 @@ def predict_carbon():
         users_collection.insert_one({
             "username": username,
             "user_data": convert_numpy_types(user_data),
-            "predicted_footprint": predicted_footprint
+            "predicted_footprint": predicted_footprint,
+            "month": month,
+    "year": year
         })
 
         # Send to Kafka
@@ -178,8 +184,47 @@ def predict_carbon():
             upsert=True
         )
 
+        similar_users_recommendations = []
+        all_users = list(aggregated_collection.find({"username": {"$ne": username}}))
+        if all_users:
+            agg_df = pd.DataFrame(all_users)
+            usernames_list = agg_df["username"].tolist()
+            agg_df = agg_df.drop(columns=["username", "_id"], errors="ignore")
+            for col in agg_df.columns:
+                agg_df[col] = agg_df[col].apply(lambda x: Counter(x).most_common(1)[0][0] if isinstance(x, list) else x)
+
+            current_agg = aggregated_data.copy()
+            current_agg.pop("username", None)
+            current_agg = {k: Counter(v).most_common(1)[0][0] if isinstance(v, list) else v for k, v in current_agg.items()}
+            current_df = pd.DataFrame([current_agg])
+            full_df = pd.concat([agg_df, current_df], ignore_index=True)
+
+            for col in full_df.columns:
+                if full_df[col].dtype == object:
+                    le = LabelEncoder()
+                    full_df[col] = le.fit_transform(full_df[col].astype(str))
+
+            sim_matrix = cosine_similarity(full_df)
+            current_user_index = len(full_df) - 1
+            sim_scores = list(enumerate(sim_matrix[current_user_index][:-1]))
+            top_similar = sorted(sim_scores, key=lambda x: x[1], reverse=True)[:3]
+            similar_usernames = [usernames_list[idx] for idx, _ in top_similar]
+
+            for sim_user in similar_usernames:
+                reduction_entry = reduction_collection.find_one({"username": sim_user})
+                if reduction_entry:
+                    for item in reduction_entry.get("reducing_attributes", []):
+                        for attr, _ in item.items():
+                            similar_users_recommendations.append(attr)
+
+        recommended_actions = [
+            {"attribute": attr, "count": count}
+            for attr, count in Counter(similar_users_recommendations).most_common(5)
+        ]
+
         return jsonify({
-            "predicted_footprint": predicted_footprint
+            "predicted_footprint": predicted_footprint,
+            "recommendations": recommended_actions
         })
 
     except Exception as e:
@@ -252,4 +297,4 @@ def analyze_reducing_attributes(username):
     )
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(port=5001)
